@@ -185,10 +185,19 @@ class BloomeeMusicPlayer extends BaseAudioHandler
       //check if the current queue is empty and if it is, add related songs
       EasyThrottle.throttle('loadRelatedSongs', const Duration(seconds: 5),
           () async => check4RelatedSongs());
-      if (((audioPlayer.duration != null &&
-              audioPlayer.duration?.inSeconds != 0 &&
+      // Prefer a shorter, known metadata duration to avoid silent tails
+      Duration? effectiveDur = audioPlayer.duration;
+      final mdur = mediaItem.value?.duration;
+      if (mdur != null) {
+        if (effectiveDur == null || mdur < effectiveDur) {
+          effectiveDur = mdur;
+        }
+      }
+
+      if (((effectiveDur != null &&
+              effectiveDur.inSeconds != 0 &&
               event.inMilliseconds >
-                  audioPlayer.duration!.inMilliseconds - endingOffset)) &&
+                  effectiveDur.inMilliseconds - endingOffset)) &&
           loopMode.value != LoopMode.one &&
           _queueManager.queue.value.isNotEmpty) {
         // Add safety check for queue
@@ -306,7 +315,40 @@ class BloomeeMusicPlayer extends BaseAudioHandler
 
   @override
   Future<void> seek(Duration position) async {
-    audioPlayer.seek(position);
+    // Avoid seeking during activation; wait until player is at least loading/buffering/ready.
+    try {
+      // Clamp desired position to a safe range.
+      final dur = audioPlayer.duration;
+      Duration clamped;
+      if (position < Duration.zero) {
+        clamped = Duration.zero;
+      } else if (dur != null && position > dur) {
+        clamped = dur;
+      } else {
+        clamped = position;
+      }
+
+      final ps = audioPlayer.processingState;
+      if (ps == ProcessingState.idle) {
+        // Nothing loaded yet; ignore seek until a source is set.
+        log('Ignore seek while idle: $clamped', name: 'bloomeePlayer');
+        return;
+      }
+
+      if (ps == ProcessingState.loading) {
+        // Wait briefly for loading to progress to buffering/ready.
+        try {
+          await audioPlayer.processingStateStream
+              .firstWhere((s) => s != ProcessingState.loading)
+              .timeout(const Duration(seconds: 2));
+        } catch (_) {}
+      }
+
+      await audioPlayer.seek(clamped);
+    } catch (e) {
+      log('Seek failed: $e', name: 'bloomeePlayer');
+      rethrow;
+    }
   }
 
   Future<void> seekNSecForward(Duration n) async {
@@ -366,13 +408,29 @@ class BloomeeMusicPlayer extends BaseAudioHandler
 
   Future<AudioSource> getAudioSource(MediaItem mediaItem) async {
     try {
-      final audioSource = await _audioSourceManager.getAudioSource(mediaItem);
+      // Base source from manager
+      AudioSource audioSource =
+          await _audioSourceManager.getAudioSource(mediaItem);
 
       // Check if it's an offline source (file URI)
       if (audioSource.toString().contains('file://')) {
         isOffline.add(true);
       } else {
         isOffline.add(false);
+      }
+
+      // If we have a trusted duration in metadata, clip the source to
+      // prevent cases (notably YouTube) where reported duration is ~2x
+      // the actual content, leaving a silent tail.
+      final mdur = mediaItem.duration;
+      if (mdur != null &&
+          mdur > Duration.zero &&
+          audioSource is UriAudioSource) {
+        audioSource = ClippingAudioSource(
+          child: audioSource,
+          end: mdur,
+          tag: mediaItem,
+        );
       }
 
       return audioSource;
@@ -421,8 +479,8 @@ class BloomeeMusicPlayer extends BaseAudioHandler
   }) async {
     try {
       await pause();
-      await seek(initialPosition ?? Duration.zero);
 
+      // Set the source first, then load, then seek to the desired position.
       await audioPlayer.setAudioSource(audioSource);
       // Protect against hanging load calls (observed on Android when DNS fails).
       try {
@@ -437,6 +495,11 @@ class BloomeeMusicPlayer extends BaseAudioHandler
           await audioPlayer.stop();
         } catch (_) {}
         rethrow;
+      }
+
+      // Now perform the initial seek if requested (avoid unnecessary seek to zero).
+      if (initialPosition != null && initialPosition > Duration.zero) {
+        await seek(initialPosition);
       }
 
       if (!audioPlayer.playing) {
