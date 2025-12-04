@@ -1,4 +1,4 @@
-name: Build Final Flutter App
+name: Build IOS App
 
 on: workflow_dispatch
 
