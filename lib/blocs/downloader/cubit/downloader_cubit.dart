@@ -40,8 +40,16 @@ class DownloaderCubit extends Cubit<DownloaderState> {
   }
 
   Future<Directory> _getDownloadDirectory() async {
-    if (Platform.isAndroid || Platform.isIOS) {
-      // For Android and iOS, use the internal storage's downloads directory
+    if (Platform.isIOS) {
+      // For iOS, use Documents/Downloads to make files visible in Files app
+      final documentsDir = await getApplicationDocumentsDirectory();
+      final downloadDir = Directory('${documentsDir.path}/Downloads');
+      if (!await downloadDir.exists()) {
+        await downloadDir.create(recursive: true);
+      }
+      return downloadDir;
+    } else if (Platform.isAndroid) {
+      // For Android, use the internal storage's downloads directory
       final directory = (await getDownloadsDirectory()) ??
           await getApplicationDocumentsDirectory();
       return directory;

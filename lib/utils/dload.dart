@@ -4,6 +4,7 @@ import 'dart:isolate';
 import 'dart:math';
 
 import 'package:Bloomee/model/songModel.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
@@ -103,6 +104,15 @@ class DownloadEngine {
     }
   }
 
+  /// Ensures the directory exists before downloading
+  Future<void> _ensureDirectoryExists(String filePath) async {
+    final file = File(filePath);
+    final directory = file.parent;
+    if (!await directory.exists()) {
+      await directory.create(recursive: true);
+    }
+  }
+
   Future<void> _processNext() async {
     if (_queue.isEmpty) {
       _isProcessing = false;
@@ -169,6 +179,73 @@ class DownloadEngine {
 
   Future<void> _downloadFile(
       DownloadTask task, Function(double) onProgress) async {
+    // Use simple download for iOS, parallel download for other platforms
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      await _downloadFileSimple(task, onProgress);
+    } else {
+      await _downloadFileParallel(task, onProgress);
+    }
+  }
+
+  /// Simple, sequential download for iOS (no isolates)
+  Future<void> _downloadFileSimple(
+      DownloadTask task, Function(double) onProgress) async {
+    // Ensure the target directory exists
+    await _ensureDirectoryExists(task.targetPath);
+
+    final uri = Uri.parse(task.url);
+    final response = await http.head(uri).timeout(const Duration(seconds: 10));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception(
+          'Server responded with status code ${response.statusCode}');
+    }
+    final contentLengthStr = response.headers['content-length'];
+    if (contentLengthStr == null) {
+      throw Exception('File size could not be determined from the server.');
+    }
+    final contentLength = int.parse(contentLengthStr);
+    if (contentLength <= 0) {
+      throw Exception('File has zero or invalid size.');
+    }
+
+    final targetFile = File(task.targetPath);
+    final request = http.Request('GET', uri);
+    final streamedResponse =
+        await request.send().timeout(const Duration(seconds: 60));
+
+    if (streamedResponse.statusCode < 200 ||
+        streamedResponse.statusCode >= 300) {
+      throw Exception(
+          'Download failed with status code ${streamedResponse.statusCode}');
+    }
+
+    final fileSink = targetFile.openWrite();
+    int downloadedBytes = 0;
+
+    await streamedResponse.stream.listen(
+      (chunk) {
+        fileSink.add(chunk);
+        downloadedBytes += chunk.length;
+        onProgress(min(downloadedBytes / contentLength, 1.0));
+      },
+      onDone: () async {
+        await fileSink.close();
+      },
+      onError: (e) {
+        throw Exception('Download stream error: $e');
+      },
+      cancelOnError: true,
+    ).asFuture();
+
+    await fileSink.close();
+  }
+
+  /// Parallel download using isolates for Android/Desktop
+  Future<void> _downloadFileParallel(
+      DownloadTask task, Function(double) onProgress) async {
+    // Ensure the target directory exists
+    await _ensureDirectoryExists(task.targetPath);
+
     final uri = Uri.parse(task.url);
     final response = await http.head(uri).timeout(const Duration(seconds: 10));
     if (response.statusCode < 200 || response.statusCode >= 300) {
