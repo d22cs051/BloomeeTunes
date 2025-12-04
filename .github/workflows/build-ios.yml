@@ -15,9 +15,7 @@ jobs:
               channel: 'stable'
           - run: ls -la && flutter pub get
           - run: flutter pub cache repair
-          - run: cd ios
-          - run: pod install --repo-update
-          - run: cd ..
+          - run: cd ios && pod install --repo-update
           - run: flutter build ipa --release --no-codesign
           - name: Create IPA
             run: |
